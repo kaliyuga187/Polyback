@@ -1,0 +1,39 @@
+# openclaw-studio.service
+# Systemd unit — auto-starts OpenClaw Studio on boot
+#
+# Install:
+#   sudo cp openclaw-studio.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now openclaw-studio
+
+[Unit]
+Description=OpenClaw Studio (Ollama + LiteLLM + Open WebUI)
+Documentation=https://github.com/kaliyuga187/Polyback
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/openclaw
+
+# Pull latest images then bring stack up
+ExecStartPre=/usr/bin/docker compose pull --quiet
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+
+ExecStop=/usr/bin/docker compose down
+
+# Restart the service (and therefore the containers) if it crashes
+Restart=on-failure
+RestartSec=30s
+
+# Give containers time to start before reporting success
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-studio
+
+[Install]
+WantedBy=multi-user.target
