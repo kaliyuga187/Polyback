@@ -3,145 +3,82 @@ Polymarket strategy reverse tool
 
 ---
 
-## OpenClaw Studio — free local AI, deployable on Vultr
+## OpenClaw Studio — free local AI in one script
 
-Run Claude Code (or any Anthropic-API client) against a locally-hosted
-**Qwen2.5-Coder** model at zero per-token cost. Includes a full browser
-chat studio (Open WebUI) and one-command Vultr cloud deployment.
+Run Claude Code against a locally-hosted **Qwen2.5-Coder** model at zero cost.
+Everything — Ollama, LiteLLM proxy, Open WebUI studio, systemd auto-start — is
+compiled into a single script: **`openclaw.sh`**
 
 ```
-┌──────────────┐    ┌─────────────────────┐    ┌──────────────────┐
-│  Claude Code │───►│  LiteLLM proxy :4000│───►│  Ollama :11434   │
-│  (your box)  │    │  (Anthropic ↔ OAI)  │    │  Qwen2.5-Coder   │
-└──────────────┘    └─────────────────────┘    └──────────────────┘
-                                                        │
-┌──────────────┐                                        │
-│ Open WebUI   │◄───────────────────────────────────────┘
-│ studio :3000 │   (browser chat, model management)
-└──────────────┘
+Qwen2.5-Coder (Ollama) ──► LiteLLM proxy :4000 ──► Claude Code
+                      └──► Open WebUI :3000  (browser chat studio)
 ```
 
 ---
 
-## Option A — Run locally (your own machine)
+## Usage
 
+### Local machine (no Docker, launches Claude Code)
 ```bash
-# 1. Install Ollama + pull Qwen (one-time)
-./setup_ollama.sh
+./openclaw.sh           # auto-detects non-root → local mode
+./openclaw.sh local     # explicit
+```
 
-# 2. Start full Docker stack (studio + proxy)
-docker compose up -d
+### Vultr / server (Docker stack + systemd auto-start, run as root)
+```bash
+sudo ./openclaw.sh vultr
+# — or paste into Vultr User Data for fully automated deploy —
+```
 
-# 3. Open browser studio
-open http://localhost:3000
-
-# 4. Point Claude Code at local proxy
-source .env.local && claude
+### Custom model
+```bash
+QWEN_MODEL=qwen2.5-coder:14b ./openclaw.sh
 ```
 
 ---
 
-## Option B — Deploy on Vultr (auto-start on boot)
+## How it works
 
-### Recommended instance
+| Mode | Stack | Survives reboot |
+|---|---|---|
+| `local` | Ollama + LiteLLM native processes | no |
+| `vultr` | Docker Compose (Ollama + LiteLLM + Open WebUI) + systemd | yes |
 
-| | |
-|---|---|
-| Plan | **Optimized Cloud Compute** |
-| CPU | 4 vCPU / 8 GB RAM (CPU) — or any GPU instance |
-| OS | Ubuntu 22.04 LTS x64 |
-| Cost | ~$48/mo CPU · GPU pricing varies |
+Both modes write a temporary LiteLLM config that maps every Claude model name
+to the local Qwen instance, then set `ANTHROPIC_BASE_URL` so Claude Code never
+contacts Anthropic's servers.
 
-### Step 1 — Create Vultr instance with User Data
+---
 
-1. Go to **Vultr → Deploy New Server**
-2. Choose OS: **Ubuntu 22.04**
-3. Scroll to **Additional Features → User Data**
-4. Paste the entire contents of `vultr_startup.sh` into the field
-5. Deploy
+## Vultr deploy
 
-The script runs automatically on first boot and:
-- Configures UFW firewall (ports 3000, 4000, 11434)
-- Installs Docker + NVIDIA toolkit (if GPU present)
-- Clones this repo to `/opt/openclaw`
-- Installs & enables `openclaw-studio.service` (survives reboots)
-- Pulls the Qwen model and starts all services
-
-### Step 2 — Access your studio (~5–10 min after deploy)
-
-```
-http://<vultr-ip>:3000   → Open WebUI (browser chat)
-http://<vultr-ip>:4000   → LiteLLM proxy (for Claude Code)
-http://<vultr-ip>:11434  → Ollama raw API
-```
-
-### Step 3 — Point Claude Code on your laptop at the server
-
+1. Create **Ubuntu 22.04** instance (≥4 vCPU / 8 GB RAM recommended)
+2. Paste `openclaw.sh` contents into **User Data** → Deploy
+3. After ~5–10 min: open `http://<ip>:3000`
+4. On your laptop:
 ```bash
-export ANTHROPIC_BASE_URL=http://<vultr-ip>:4000
+export ANTHROPIC_BASE_URL=http://<ip>:4000
 export ANTHROPIC_API_KEY=sk-local-free
 claude
 ```
 
-Or add to your shell profile to make it permanent:
-
-```bash
-echo 'export ANTHROPIC_BASE_URL=http://<vultr-ip>:4000' >> ~/.zshrc
-echo 'export ANTHROPIC_API_KEY=sk-local-free'           >> ~/.zshrc
-```
+Ports opened automatically: `3000` (studio) · `4000` (proxy) · `11434` (Ollama)
 
 ---
 
 ## Model options
 
-| Model | VRAM / RAM | Quality |
+| Model | RAM needed | Quality |
 |---|---|---|
 | `qwen2.5-coder:7b` (default) | 5 GB | Good |
 | `qwen2.5-coder:14b` | 10 GB | Better |
 | `qwen2.5-coder:32b` | 22 GB | Best |
 
-Change model before deploying:
-
-```bash
-# In User Data or on the server:
-QWEN_MODEL=qwen2.5-coder:14b ./vultr_startup.sh
-```
-
-Or on a running server:
-
-```bash
-cd /opt/openclaw
-QWEN_MODEL=qwen2.5-coder:14b docker compose up -d
-```
-
 ---
 
-## Service management (on Vultr server)
-
+## Service management (Vultr)
 ```bash
-# Status
 systemctl status openclaw-studio
-
-# Restart
 systemctl restart openclaw-studio
-
-# View logs
 journalctl -u openclaw-studio -f
-
-# Stop
-systemctl stop openclaw-studio
 ```
-
----
-
-## File reference
-
-| File | Purpose |
-|---|---|
-| `docker-compose.yml` | Ollama + LiteLLM + Open WebUI stack |
-| `litellm_config.yaml` | Maps Claude model names → Ollama |
-| `openclaw-studio.service` | Systemd unit (auto-start on boot) |
-| `vultr_startup.sh` | Vultr User Data / cloud-init script |
-| `setup_ollama.sh` | Local Ollama install helper |
-| `run_local.sh` | Local single-command launcher |
-| `.env.local` | Env vars for Claude Code → local proxy |
