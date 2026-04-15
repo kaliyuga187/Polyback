@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Polymarket Edge Bot v10 — Data API + CLOB trading
-Uses Polymarket Data API (data-api.polymarket.com) for live market discovery.
-Combined with CLOB for real-time prices + order execution.
+Uses Data API leaderboard to find active markets + CLOB for prices and trading.
+Data API: https://data-api.polymarket.com (auth required)
 """
 import os, time, json, hmac, hashlib, base64, urllib.request, urllib.error
 from datetime import datetime, timezone
@@ -53,87 +53,157 @@ def daily_loss():
     d = rd("/root/.openclaw/daily_pnl.json")
     return d.get("loss", 0) if d.get("date") == str(datetime.now().date()) else 0
 
-# ── Data API — live market discovery ───────────────────────────────
-_cache      = []
-_cache_time = 0
-CACHE_TTL  = 120
+# ── Data API calls ─────────────────────────────────────────────────
+def _sig(path):
+    ts   = str(int(time.time() * 1000))
+    msg  = ts + "GET" + path
+    sig  = hmac.new(KEY_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
+    auth = base64.b64encode(sig).decode()
+    hdrs = {
+        "Authorization": "Bearer " + auth,
+        "POLY-API-KEY": KEY_ID,
+        "POLY-API-SECRET": KEY_SECRET,
+        "POLY-API-PASSPHRASE": KEY_PASS,
+        "POLY-API-TIMESTAMP": ts,
+        "Accept": "application/json",
+        "User-Agent": "PolyEdge/1.0",
+    }
+    return hdrs
 
-def api_get(path, params=None, token=None):
-    """Call Data API with optional HMAC auth."""
-    url = DATA_HOST + path
-    if params:
-        qs = "&".join("%s=%s" % (k, v) for k, v in params.items())
-        url += "?" + qs
-    hdrs = {"Accept": "application/json", "User-Agent": "PolyEdge/1.0"}
-    if token:
-        ts = str(int(time.time() * 1000))
-        msg = ts + "GET" + path + (("?" + qs) if params else "")
-        sig = hmac.new(token.encode(), msg.encode(), hashlib.sha256).digest()
-        hdrs.update({
-            "POLY-API-KEY": KEY_ID,
-            "POLY-API-SECRET": KEY_SECRET,
-            "POLY-API-PASSPHRASE": KEY_PASS,
-            "POLY-API-TIMESTAMP": ts,
-            "POLY-API-SIGNATURE": base64.b64encode(sig).decode(),
-        })
+def api_get(path):
+    """Call Data API with HMAC auth. Returns JSON or None."""
     try:
-        req = urllib.request.Request(url, headers=hdrs)
+        url  = DATA_HOST + path
+        hdrs = _sig(path)
+        req  = urllib.request.Request(url, headers=hdrs)
         with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        return {"error": "HTTP %d" % e.code}
     except Exception as e:
-        return {"error": str(e)}
+        L("DataAPI error%s: %s" % (path, e), "ERROR")
+        return None
 
-def get_live_markets():
-    """Get all active markets via Data API."""
-    global _cache, _cache_time
+# ── Discover active markets via leaderboard ──────────────────────────
+# Top traders reveal which markets have real money flowing
+_market_cache      = []
+_cache_time        = 0
+CACHE_TTL          = 180  # 3 min
+
+def get_leaderboard_markets():
+    """Get list of active market slugs from top traders' positions."""
+    global _market_cache, _cache_time
     now = time.time()
-    if _cache and (now - _cache_time) < CACHE_TTL:
-        return _cache
+    if _market_cache and (now - _cache_time) < CACHE_TTL:
+        return _market_cache
     
-    markets = []
+    slugs = set()
+    # Scan multiple leaderboard perspectives
+    for period in ["ALL", "MONTH", "WEEK"]:
+        r = api_get("/v1/leaderboard?timePeriod=%s&orderBy=PNL&limit=20" % period)
+        if not r or not isinstance(r, list):
+            continue
+        for w in r[:10]:
+            addr = w.get("proxyWallet", "")
+            if not addr:
+                continue
+            # Get their recent closed positions to find active market slugs
+            cp = api_get("/closed-positions?user=%s&limit=20" % addr)
+            if isinstance(cp, list):
+                for p in cp[:5]:
+                    slug = p.get("eventSlug", "")
+                    if slug:
+                        slugs.add(slug)
     
-    # Try Data API markets endpoint
-    for offset in [0, 100, 200]:
-        r = api_get("/markets", {"limit": 100, "offset": offset, "closed": "false", "archived": "false"})
-        if "error" in r:
-            break
-        data = r.get("data", r) if isinstance(r, dict) else r
-        if not isinstance(data, (list, tuple)):
-            data = data.get("data", []) if isinstance(data, dict) else []
-        if not data:
-            break
-        for m in data:
-            if not isinstance(m, dict): continue
-            # Skip expired
-            end = m.get("endDate", "") or m.get("end_date", "")
-            if end:
-                try:
-                    ed = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                    if ed < datetime.now(timezone.utc): continue
-                except: pass
-            markets.append(m)
-        if len(data) < 100: break
+    # Also get open positions
+    for period in ["ALL", "MONTH"]:
+        r = api_get("/v1/leaderboard?timePeriod=%s&orderBy=PNL&limit=10" % period)
+        if not r or not isinstance(r, list):
+            continue
+        for w in r[:5]:
+            addr = w.get("proxyWallet", "")
+            if not addr:
+                continue
+            op = api_get("/positions?user=%s&limit=10" % addr)
+            if isinstance(op, list):
+                for p in op[:5]:
+                    slug = p.get("eventSlug", "")
+                    if slug:
+                        slugs.add(slug)
     
-    _cache     = markets
-    _cache_time = now
-    L("Data API: %d live markets" % len(markets))
-    return markets
+    result = sorted(slugs)
+    _market_cache = result
+    _cache_time   = now
+    L("Leaderboard: found %d market slugs" % len(result))
+    return result
 
-# ── Also try CLOB orderbook for prices on active conditions ──────────
-def get_clob_price(token_id):
+# ── CLOB: get live price for a market slug ──────────────────────────
+def get_cLOB_price_for_slug(slug):
+    """Try to get price from CLOB orderbook for a market slug."""
     try:
-        url = "%s/orderbook/%s" % (CLOB_HOST, token_id)
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            ob = json.loads(r.read())
-        bids = ob.get("bids", []); asks = ob.get("asks", [])
-        best_bid = float(bids[0]["price"]) if bids else 0
-        best_ask = float(asks[0]["price"]) if asks else 0
-        if best_bid and best_ask: return (best_bid + best_ask) / 2
-        return best_bid if best_bid else None
-    except: return None
+        # Try slug as condition_id or market slug directly
+        for endpoint in [
+            "https://clob.polymarket.com/orderbook/%s" % slug,
+            "https://clob.polymarket.com/markets?slug=" + slug,
+        ]:
+            try:
+                req = urllib.request.Request(endpoint, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    ob = json.loads(r.read())
+                    bids = ob.get("bids", []); asks = ob.get("asks", [])
+                    if bids or asks:
+                        best_bid = float(bids[0]["price"]) if bids else 0
+                        best_ask = float(asks[0]["price"]) if asks else 0
+                        if best_bid and best_ask:
+                            return (best_bid + best_ask) / 2
+                        return best_bid if best_bid else None
+            except:
+                pass
+    except:
+        pass
+    return None
+
+# ── CLOB generic market fetch ───────────────────────────────────────
+def get_all_active_cLOB_markets():
+    """Fallback: fetch all markets from CLOB, filter for active with prices."""
+    try:
+        url  = "https://clob.polymarket.com/markets?limit=1000"
+        req  = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read())
+        
+        markets = resp.get("data", []) if isinstance(resp, dict) else (resp or [])
+        now_dt  = datetime.now(timezone.utc)
+        active  = []
+        
+        for m in markets:
+            if not isinstance(m, dict): continue
+            if m.get("archived") or m.get("closed"):
+                continue
+            tokens = m.get("tokens", [])
+            if not tokens or len(tokens) < 2:
+                continue
+            try:
+                yes_price = float(tokens[0].get("price", 0) or 0)
+                no_price  = float(tokens[1].get("price", 0) or 0)
+            except:
+                continue
+            if yes_price == 0 and no_price == 0:
+                continue
+            # Check end date
+            end_str = m.get("end_date_iso", "")
+            if end_str:
+                try:
+                    end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                    if end_dt < now_dt:
+                        continue
+                except:
+                    pass
+            active.append(m)
+        
+        L("CLOB: %d active markets" % len(active))
+        return active
+    except Exception as e:
+        L("CLOB markets error: %s" % e, "ERROR")
+        return []
 
 # ── Strategy ──────────────────────────────────────────────────────
 MIN_YES   = 0.38
@@ -141,7 +211,7 @@ MIN_VOL   = 5_000
 MIN_EDGE  = 0.30
 SKIP_KWDS = {"trump", "biden", "harris", "election", "president", "federal",
              "senate", "congress", "governor", "republican", "democratic",
-             "nominee", "nomination", "who will win", "will there be"}
+             "nominee", "nomination"}
 
 def calc_edge(yes_p, conv=0.8):
     return max(0, (1 - yes_p) * conv)
@@ -197,7 +267,7 @@ def place_order(condition_id, side, price, size):
             resp = json.loads(r.read())
         if resp.get("orderID"):
             return True, resp["orderID"], resp.get("status", "")
-        err = resp.get("error", {})
+        err  = resp.get("error", {})
         emsg = err.get("message", str(err)) if isinstance(err, dict) else str(resp.get("message", str(err)))
         return False, "", emsg
     except urllib.error.HTTPError as e:
@@ -207,7 +277,7 @@ def place_order(condition_id, side, price, size):
 
 # ── Main ───────────────────────────────────────────────────────────
 cycle = 0
-L("Bot v10 -- Data API + CLOB | mode=%s | interval=%ds" % (MODE, INTERVAL))
+L("Bot v10 -- Data API leaderboard + CLOB | mode=%s" % MODE)
 
 while True:
     cycle += 1
@@ -217,40 +287,42 @@ while True:
         L("MAX DAILY LOSS -- standing down")
         time.sleep(INTERVAL); continue
     
-    markets = get_live_markets()
+    # Primary: use leaderboard to find what top traders are active in
+    slugs = get_leaderboard_markets()
     
-    if not markets:
-        L("No markets from Data API, trying CLOB fallback...")
-        # Fallback: scan CLOB orderbook for active tokens with prices
-        r = api_get("/markets", {"limit": 50})
-        if "error" in r:
-            L("Data API error: %s" % r["error"])
+    # Fallback: CLOB active market scan
+    markets = get_all_active_cLOB_markets()
+    
+    if not markets and not slugs:
+        L("No market data, sleeping 60s")
         time.sleep(60); continue
     
-    # Score markets
+    # Score all markets
     scored = []
     for m in markets:
         if not isinstance(m, dict): continue
-        # Get price
-        op = m.get("outcomePrices", [])
-        if isinstance(op, str):
-            try: op = json.loads(op.replace("'", '"'))
-            except: pass
-        if not op or len(op) < 2: continue
-        try: yes_p = float(op[0])
-        except: continue
-        if yes_p <= 0.001 or yes_p >= 0.999: continue
-        if should_trade(m, yes_p):
-            scored.append((m, yes_p, score_it(m, yes_p)))
+        tokens = m.get("tokens", [])
+        for t in tokens:
+            outcome = (t.get("outcome") or "").lower()
+            if outcome not in ("yes", "1", 1):
+                continue
+            try:
+                yes_p = float(t.get("price", 0))
+            except:
+                continue
+            if yes_p <= 0.001 or yes_p >= 0.999:
+                continue
+            if should_trade(m, yes_p):
+                scored.append((m, yes_p, score_it(m, yes_p)))
     
     if not scored:
-        L("No opportunities (%d markets scanned)" % len(markets))
+        L("No opportunities (%d active markets scanned)" % len(markets))
         time.sleep(INTERVAL); continue
     
     scored.sort(key=lambda x: x[2], reverse=True)
     best, yes_p, edge = scored[0]
     m             = best
-    condition_id  = m.get("conditionId", m.get("condition_id", ""))
+    condition_id  = m.get("condition_id", "")
     q             = best.get("question", "?")[:80]
     vol           = float(best.get("volume24hr", 0) or 0) or float(best.get("volume", 0) or 0)
     cat           = best.get("category", "Other") or "Other"
@@ -274,6 +346,9 @@ while True:
             tg("<b>Signal</b>\n%s\nPrice: %.4f\nEdge: %.2f\n%s" % (q[:50], yes_p, edge, status))
             L("  -> %s" % status)
     else:
-        L("  [ALERT] edge=%.2f sz=$%.2f" % (edge, sz)) if net > 0 else L("  [SKIP] fee > edge")
+        if net <= 0:
+            L("  [SKIP] fee > edge")
+        else:
+            L("  [ALERT] edge=%.2f sz=$%.2f" % (edge, sz))
     
     time.sleep(INTERVAL)
