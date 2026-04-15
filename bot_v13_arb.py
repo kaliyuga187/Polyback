@@ -101,10 +101,11 @@ def get_market_prices(client, condition_id, yes_token_id, no_token_id):
 
 # ── ARB SCANNER ────────────────────────────────────────────────────
 CLOB_HOST = "https://clob.polymarket.com"
+DATA_HOST = "https://data-api.polymarket.com"
 FEE_RATE  = 0.02  # 2% fee on winnings
 
-def fetch_markets():
-    """Fetch active markets from CLOB."""
+def fetch_markets_via_clob():
+    """Fallback: fetch markets directly from CLOB REST."""
     try:
         req = urllib.request.Request(
             f"{CLOB_HOST}/markets?limit=500",
@@ -113,18 +114,57 @@ def fetch_markets():
         with urllib.request.urlopen(req, timeout=15) as r:
             resp = json.loads(r.read())
         markets = resp.get("data", []) if isinstance(resp, dict) else (resp or [])
-        # Filter to active, non-archived, with volume
         active = [
             m for m in markets
             if not m.get("archived")
             and float(m.get("volume24hr", 0) or 0) > 0
-            and not any(k in (m.get("question","")+" "+m.get("category","")).lower()
-                       for k in ("trump","biden","election","senate","congress"))
         ]
         return active
     except Exception as e:
-        L(f"Fetch error: {e}", "ERROR")
+        L(f"CLOB fetch error: {e}", "ERROR")
         return []
+
+def fetch_markets():
+    """Try Data API first for live markets, fall back to CLOB."""
+    # Try Data API — has live active markets
+    try:
+        import hmac, hashlib, time as time_module, base64 as b64
+        ts = str(int(time_module.time() * 1000))
+        # HMAC auth for data API
+        msg = ts + "GET" + "/v1/markets"
+        sig = hmac.new(
+            KEY_SECRET.encode(), msg.encode(), hashlib.sha256
+        ).digest()
+        hdrs = {
+            "POLY-API-KEY": KEY_ID,
+            "POLY-API-SECRET": KEY_SECRET,
+            "POLY-API-TIMESTAMP": ts,
+            "POLY-API-NONCE": ts,
+            "POLY-API-SIGNATURE": b64.b64encode(sig).decode(),
+            "Accept": "application/json",
+        }
+        req = urllib.request.Request(f"{DATA_HOST}/v1/markets", headers=hdrs)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            resp = json.loads(r.read())
+        markets = resp if isinstance(resp, list) else resp.get("data", [])
+        L(f"Data API returned {len(markets)} markets")
+        # Filter to active markets with meaningful prices
+        active = [
+            m for m in markets
+            if m.get("question")
+            and float(m.get("price", 0) or 0) > 0.001
+            and float(m.get("volume24hr", 0) or 0) >= 100
+            and not any(k in (m.get("question","")+" "+m.get("category","")).lower()
+                       for k in ("trump","biden","election","senate","congress","governor"))
+        ]
+        if active:
+            L(f"Found {len(active)} active Data API markets")
+            return active[:50]
+    except Exception as e:
+        L(f"Data API error: {e}", "WARN")
+
+    # Fall back to CLOB
+    return fetch_markets_via_clob()
 
 def calc_arb(yes_mid, no_mid):
     """Calculate arb profit after fees. Returns (profit_pct, spend, profit)."""
@@ -210,7 +250,7 @@ while True:
     L(f"  Found {len(markets)} active markets")
 
     opps = []
-    for m in markets[:50]:  # scan top 50 by volume
+    for m in markets[:15]:  # scan top 15 to avoid rate limits
         tokens = m.get("tokens", [])
         yes_tok = next((t for t in tokens if str(t.get("outcome","")).lower() in ("yes","1",1)), None)
         no_tok  = next((t for t in tokens if str(t.get("outcome","")).lower() in ("no","0",0)), None)
@@ -222,12 +262,17 @@ while True:
         if not yes_tid or not no_tid:
             continue
 
-        yes_mid, no_mid, yes_b, yes_a, no_b, no_a = get_market_prices(
-            client, m.get("condition_id"), yes_tid, no_tid
-        )
+        try:
+            yes_mid, no_mid, yes_b, yes_a, no_b, no_a = get_market_prices(
+                client, m.get("condition_id"), yes_tid, no_tid
+            )
+        except Exception as e:
+            L(f"  Price fetch error for {m.get('question','')[:40]}: {e}", "WARN")
+            continue
         if yes_mid <= 0 or no_mid <= 0:
             continue
 
+        time.sleep(0.5)  # rate limit protection
         profit_pct, spend, profit = calc_arb(yes_mid, no_mid)
         if profit_pct >= MIN_SPREAD_PCT:
             opps.append({
@@ -248,7 +293,7 @@ while True:
         L(f"  {best['question']}")
         L(f"  YES={best['yes_mid']:.4f} NO={best['no_mid']:.4f} SUM={best['yes_mid']+best['no_mid']:.4f}")
         L(f"  Profit: {best['profit_pct']*100:.2f}% = ${best['profit']:.4f} on ${best['spend']:.2f}")
-        tg(f"🔀 <b>ARB ALERT</b>\n{_best['question']}\nYES {best['yes_mid']:.4f} + NO {best['no_mid']:.4f}\nSum: {best['yes_mid']+best['no_mid']:.4f}\nProfit: {best['profit_pct']*100:.2f}% (${best['profit']:.4f})")
+        tg(f"🔀 <b>ARB ALERT</b>\n{best['question']}\nYES {best['yes_mid']:.4f} + NO {best['no_mid']:.4f}\nSum: {best['yes_mid']+best['no_mid']:.4f}\nProfit: {best['profit_pct']*100:.2f}% (${best['profit']:.4f})")
 
         # Auto-trade
         res = place_arb(
