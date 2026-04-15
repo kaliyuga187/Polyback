@@ -64,7 +64,7 @@ def get_clob_client(private_key):
         host="https://clob.polymarket.com",
         chain_id=NETWORK,
         key=private_key,
-        options={"signature_type": 0}  # EOA type
+        signature_type=0,  # EOA
     )
     # createOrDeriveApiKey uses nonce=0; if key exists this retrieves it
     try:
