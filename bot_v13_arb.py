@@ -64,10 +64,10 @@ def get_clob_client(private_key):
     address = acct.address
 
     client = ClobClient(
-        host="https://clob.polymarket.com",
+        host=PROXY_HOST,
         chain_id=NETWORK,
         key=private_key,
-        signature_type=0,  # EOA
+        signature_type=0,
     )
     # createOrDeriveApiKey uses nonce=0; if key exists this retrieves it
     try:
@@ -103,10 +103,11 @@ def get_market_prices(client, condition_id, yes_token_id, no_token_id):
     return yes_mid, no_mid, yes_bid, yes_ask, no_bid, no_ask
 
 # ── ARB SCANNER ────────────────────────────────────────────────────
-CLOB_HOST = "https://clob.polymarket.com"
-DATA_HOST = "https://data-api.polymarket.com"
-GRAPHQL_HOST = "https://clob.polymarket.com"
-FEE_RATE  = 0.02  # 2% fee on winnings
+CLOB_HOST   = "https://k187.naskie13b.workers.dev"
+DATA_HOST   = "https://k187.naskie13b.workers.dev"
+GRAPHQL_HOST = "https://k187.naskie13b.workers.dev"
+FEE_RATE   = 0.02  # 2% fee on winnings
+PROXY_HOST = "https://k187.naskie13b.workers.dev"
 
 def fetch_markets_via_clob():
     """Fallback: fetch markets directly from CLOB REST."""
@@ -156,11 +157,11 @@ GRAPHQL_QUERY = """
 
 def fetch_markets():
     """Try GraphQL for live markets first, then Data API, then CLOB."""
-    # Try GraphQL — no auth needed
+    # Try GraphQL via direct CLOB call (bypasses proxy path matching)
     try:
         gql_body = json.dumps({"query": GRAPHQL_QUERY.strip()}).encode()
         req = urllib.request.Request(
-            GRAPHQL_HOST + "/",
+            "https://clob.polymarket.com/",
             data=gql_body,
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             method="POST"
