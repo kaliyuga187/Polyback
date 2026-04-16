@@ -105,6 +105,7 @@ def get_market_prices(client, condition_id, yes_token_id, no_token_id):
 # ── ARB SCANNER ────────────────────────────────────────────────────
 CLOB_HOST = "https://clob.polymarket.com"
 DATA_HOST = "https://data-api.polymarket.com"
+GRAPHQL_HOST = "https://clob.polymarket.com"
 FEE_RATE  = 0.02  # 2% fee on winnings
 
 def fetch_markets_via_clob():
@@ -127,17 +128,78 @@ def fetch_markets_via_clob():
         L(f"CLOB fetch error: {e}", "ERROR")
         return []
 
+GRAPHQL_QUERY = """
+{
+  markets(
+    liquidityNumMin: 100
+    volumeNumMin: 100
+    limit: 50
+    closed: false
+  ) {
+    id
+    question
+    description
+    category
+    volume
+    liquidity
+    outcomePrices
+    outcomes
+    creator
+    createdAt
+    updatedAt
+    active
+    closed
+    tagged
+  }
+}
+"""
+
 def fetch_markets():
-    """Try Data API first for live markets, fall back to CLOB."""
-    # Try Data API — has live active markets
+    """Try GraphQL for live markets first, then Data API, then CLOB."""
+    # Try GraphQL — no auth needed
+    try:
+        gql_body = json.dumps({"query": GRAPHQL_QUERY.strip()}).encode()
+        req = urllib.request.Request(
+            GRAPHQL_HOST + "/",
+            data=gql_body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            resp = json.loads(r.read())
+        gql_markets = resp.get("data", {}).get("markets", [])
+        L(f"GraphQL returned {len(gql_markets)} markets")
+        if gql_markets:
+            # Parse GraphQL response into our format
+            parsed = []
+            for m in gql_markets:
+                if not m.get("question"): continue
+                try:
+                    out_prices = json.loads(m.get("outcomePrices", "[]"))
+                except:
+                    out_prices = []
+                parsed.append({
+                    "question": m.get("question",""),
+                    "category": m.get("category","Other") or "Other",
+                    "volume24hr": m.get("volume", 0),
+                    "archived": m.get("closed", False),
+                    "tokens": [],
+                    "_out_prices": out_prices,
+                    "_market": m,
+                })
+            active = [m for m in parsed if not m["archived"] and float(m.get("volume24hr",0)) >= 100]
+            if active:
+                L(f"GraphQL: {len(active)} active markets")
+                return active[:20]
+    except Exception as e:
+        L(f"GraphQL error: {e}", "WARN")
+
+    # Try Data API
     try:
         import hmac, hashlib, time as time_module, base64 as b64
         ts = str(int(time_module.time() * 1000))
-        # HMAC auth for data API
         msg = ts + "GET" + "/v1/markets"
-        sig = hmac.new(
-            KEY_SECRET.encode(), msg.encode(), hashlib.sha256
-        ).digest()
+        sig = hmac.new(KEY_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
         hdrs = {
             "POLY-API-KEY": KEY_ID,
             "POLY-API-SECRET": KEY_SECRET,
@@ -146,12 +208,10 @@ def fetch_markets():
             "POLY-API-SIGNATURE": b64.b64encode(sig).decode(),
             "Accept": "application/json",
         }
-        req = urllib.request.Request(f"{DATA_HOST}/v1/markets", headers=hdrs)
+        req = urllib.request.Request(f"{DATA_HOST}/v1/markets?limit=50", headers=hdrs)
         with urllib.request.urlopen(req, timeout=10) as r:
             resp = json.loads(r.read())
         markets = resp if isinstance(resp, list) else resp.get("data", [])
-        L(f"Data API returned {len(markets)} markets")
-        # Filter to active markets with meaningful prices
         active = [
             m for m in markets
             if m.get("question")
@@ -161,13 +221,12 @@ def fetch_markets():
                        for k in ("trump","biden","election","senate","congress","governor"))
         ]
         if active:
-            L(f"Found {len(active)} active Data API markets")
-            return active[:50]
+            L(f"Data API: {len(active)} active markets")
+            return active[:20]
     except Exception as e:
         L(f"Data API error: {e}", "WARN")
 
-    # Fall back to CLOB
-    return fetch_markets_via_clob()
+    return []
 
 def calc_arb(yes_mid, no_mid):
     """Calculate arb profit after fees. Returns (profit_pct, spend, profit)."""
@@ -254,7 +313,37 @@ while True:
 
     opps = []
     for m in markets[:15]:  # scan top 15 to avoid rate limits
+        question = m.get("question","")[:80]
+        gid = m.get("id","")
+
+        # Try to get YES/NO prices from orderbook
+        # GraphQL format: need to resolve token IDs from condition_id or _market
         tokens = m.get("tokens", [])
+        condition_id = m.get("condition_id", gid)
+
+        # If we have out_prices from GraphQL, use them directly
+        out_prices = m.get("_out_prices", [])
+        if out_prices and len(out_prices) >= 2:
+            try:
+                yes_mid = float(out_prices[0])
+                no_mid  = float(out_prices[1])
+                if yes_mid > 0 and no_mid > 0:
+                    profit_pct, spend, profit = calc_arb(yes_mid, no_mid)
+                    L(f"  [GraphQL] {question[:50]} YES={yes_mid:.4f} NO={no_mid:.4f} spread={profit_pct*100:.2f}%")
+                    if profit_pct >= MIN_SPREAD_PCT:
+                        opps.append({
+                            "market": m, "yes_mid": yes_mid, "no_mid": no_mid,
+                            "yes_bid": yes_mid, "yes_ask": yes_mid,
+                            "no_bid": no_mid, "no_ask": no_mid,
+                            "yes_token_id": "", "no_token_id": "",
+                            "profit_pct": profit_pct, "spend": spend, "profit": profit,
+                            "condition_id": condition_id, "question": question,
+                        })
+                    time.sleep(0.3)
+                    continue
+            except (ValueError, IndexError): pass
+
+        # Otherwise use CLOB orderbook
         yes_tok = next((t for t in tokens if str(t.get("outcome","")).lower() in ("yes","1",1)), None)
         no_tok  = next((t for t in tokens if str(t.get("outcome","")).lower() in ("no","0",0)), None)
         if not yes_tok or not no_tok:
@@ -267,10 +356,10 @@ while True:
 
         try:
             yes_mid, no_mid, yes_b, yes_a, no_b, no_a = get_market_prices(
-                client, m.get("condition_id"), yes_tid, no_tid
+                client, condition_id, yes_tid, no_tid
             )
         except Exception as e:
-            L(f"  Price fetch error for {m.get('question','')[:40]}: {e}", "WARN")
+            L(f"  Price fetch error for {question[:40]}: {e}", "WARN")
             continue
         if yes_mid <= 0 or no_mid <= 0:
             continue
@@ -285,8 +374,8 @@ while True:
                 "no_bid": no_b, "no_ask": no_a,
                 "yes_token_id": yes_tid, "no_token_id": no_tid,
                 "profit_pct": profit_pct, "spend": spend, "profit": profit,
-                "condition_id": m.get("condition_id"),
-                "question": m.get("question","")[:80],
+                "condition_id": condition_id,
+                "question": question,
             })
 
     if opps:
