@@ -64,7 +64,7 @@ def get_clob_client(private_key):
     address = acct.address
 
     client = ClobClient(
-        host=PROXY_HOST,
+        host=CLOB_HOST,
         chain_id=NETWORK,
         key=private_key,
         signature_type=0,
@@ -103,11 +103,9 @@ def get_market_prices(client, condition_id, yes_token_id, no_token_id):
     return yes_mid, no_mid, yes_bid, yes_ask, no_bid, no_ask
 
 # ── ARB SCANNER ────────────────────────────────────────────────────
-CLOB_HOST   = "https://k187.naskie13b.workers.dev"
-DATA_HOST   = "https://k187.naskie13b.workers.dev"
-GRAPHQL_HOST = "https://k187.naskie13b.workers.dev"
-FEE_RATE   = 0.02  # 2% fee on winnings
-PROXY_HOST = "https://k187.naskie13b.workers.dev"
+CLOB_HOST    = "https://clob.polymarket.com"   # direct - reachable
+DATA_PROXY  = "https://k187.naskie13b.workers.dev"  # proxy for Data API only
+FEE_RATE    = 0.02
 
 def fetch_markets_via_clob():
     """Fallback: fetch markets directly from CLOB REST."""
@@ -209,7 +207,7 @@ def fetch_markets():
             "POLY-API-SIGNATURE": b64.b64encode(sig).decode(),
             "Accept": "application/json",
         }
-        req = urllib.request.Request(f"{DATA_HOST}/v1/markets?limit=50", headers=hdrs)
+        req = urllib.request.Request(f"{DATA_PROXY}/v1/markets?limit=50", headers=hdrs)
         with urllib.request.urlopen(req, timeout=10) as r:
             resp = json.loads(r.read())
         markets = resp if isinstance(resp, list) else resp.get("data", [])
